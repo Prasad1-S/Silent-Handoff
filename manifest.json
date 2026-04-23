@@ -1,0 +1,26 @@
+{
+  "name": "silent-handoff",
+  "version": "1.0.0",
+  "description": "AI-powered clinical shift handoff brief generator",
+  "tools": [
+    {
+      "name": "generate_handoff_brief",
+      "description": "AI-powered clinical shift handoff brief generator",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "patient_id": {
+            "type": "string",
+            "description": "The patient ID to generate the handoff brief for"
+          }
+        },
+        "required": ["patient_id"]
+      },
+      "outputSchema": {
+        "type": "string",
+        "description": "structured handoff brief string"
+      }
+    }
+  ],
+  "tags": ["healthcare", "clinical", "fhir", "handoff"]
+}
