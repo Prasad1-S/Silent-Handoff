@@ -3,10 +3,12 @@ import asyncio
 from dotenv import load_dotenv
 from groq import Groq
 from mcp.server import Server
+from mcp.server.sse import SseServerTransport
 from mcp.server.stdio import stdio_server
 from mcp import types
 from fhir_client import get_patient_summary
 from prompts import SYSTEM_PROMPT, USER_PROMPT, TRIAGE_PROMPT
+from flask import Flask, request, Response
 
 load_dotenv()
 
@@ -27,7 +29,7 @@ async def list_tools():
                         "description": "The FHIR patient ID"
                     },
                     "fhir_base_url": {
-                        "type": "string", 
+                        "type": "string",
                         "description": "Optional: FHIR server base URL. Defaults to env variable."
                     }
                 },
@@ -39,11 +41,11 @@ async def list_tools():
 @server.call_tool()
 async def call_tool(name: str, arguments: dict):
     if name == "generate_handoff_brief":
-
         patient_id = arguments.get("patient_id")
-        fhir_base_url = arguments.get(
-            "fhir_base_url", 
-            os.getenv("FHIR_BASE_URL", "https://r4.smarthealthit.org")
+        fhir_base_url = (
+            arguments.get("fhir_base_url")
+            or os.getenv("FHIR_BASE_URL")
+            or "https://r4.smarthealthit.org"
         )
 
         # 1. Fetch FHIR data
@@ -98,9 +100,42 @@ async def call_tool(name: str, arguments: dict):
 
     return [types.TextContent(type="text", text="Unknown tool")]
 
-async def main():
+
+# ─── SSE Transport (for Render / any HTTP host) ───────────────────────────────
+
+flask_app = Flask(__name__)
+sse_transport = SseServerTransport("/messages/")
+
+@flask_app.route("/sse")
+def sse_endpoint():
+    async def handle():
+        async with sse_transport.connect_sse(request.environ) as (r, w):
+            await server.run(r, w, server.create_initialization_options())
+    asyncio.run(handle())
+
+@flask_app.route("/messages/", methods=["POST"])
+def handle_messages():
+    async def handle():
+        await sse_transport.handle_post_message(request.environ, None, None)
+    asyncio.run(handle())
+    return Response("ok", status=202)
+
+@flask_app.route("/health")
+def health():
+    return {"status": "ok"}
+
+
+# ─── Entrypoint ───────────────────────────────────────────────────────────────
+
+async def main_stdio():
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    mode = os.getenv("TRANSPORT", "stdio")
+    if mode == "sse":
+        # Render / HTTP hosting
+        flask_app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    else:
+        # Local stdio (default)
+        asyncio.run(main_stdio())
