@@ -8,7 +8,11 @@ from mcp.server.stdio import stdio_server
 from mcp import types
 from fhir_client import get_patient_summary
 from prompts import SYSTEM_PROMPT, USER_PROMPT, TRIAGE_PROMPT
-from flask import Flask, request, Response
+from starlette.applications import Starlette
+from starlette.routing import Route, Mount
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+import uvicorn
 
 load_dotenv()
 
@@ -48,7 +52,6 @@ async def call_tool(name: str, arguments: dict):
             or "https://r4.smarthealthit.org"
         )
 
-        # 1. Fetch FHIR data
         summary = get_patient_summary(patient_id, fhir_base_url)
 
         def to_str(val):
@@ -56,21 +59,17 @@ async def call_tool(name: str, arguments: dict):
 
         observations = f"Labs:\n{to_str(summary['labs'])}\n\nVitals:\n{to_str(summary['vitals'])}"
 
-        # 2. Triage
         triage_result = ""
         try:
             triage_completion = groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
-                messages=[
-                    {"role": "user", "content": TRIAGE_PROMPT.format(observations=observations)}
-                ],
+                messages=[{"role": "user", "content": TRIAGE_PROMPT.format(observations=observations)}],
                 temperature=0.0
             )
             triage_result = triage_completion.choices[0].message.content
         except Exception as e:
             triage_result = "Triage unavailable"
 
-        # 3. Generate handoff brief
         user_content = USER_PROMPT.format(
             name=summary.get("name", "Not available"),
             age=summary.get("age", "Not available"),
@@ -101,29 +100,31 @@ async def call_tool(name: str, arguments: dict):
     return [types.TextContent(type="text", text="Unknown tool")]
 
 
-# ─── SSE Transport (for Render / any HTTP host) ───────────────────────────────
+# ─── SSE Transport ────────────────────────────────────────────────────────────
 
-flask_app = Flask(__name__)
 sse_transport = SseServerTransport("/messages/")
 
-@flask_app.route("/sse")
-def sse_endpoint():
-    async def handle():
-        async with sse_transport.connect_sse(request.environ) as (r, w):
-            await server.run(r, w, server.create_initialization_options())
-    asyncio.run(handle())
+async def handle_sse(request: Request):
+    async with sse_transport.connect_sse(
+        request.scope, request.receive, request._send
+    ) as (read_stream, write_stream):
+        await server.run(read_stream, write_stream, server.create_initialization_options())
 
-@flask_app.route("/messages/", methods=["POST"])
-def handle_messages():
-    async def handle():
-        await sse_transport.handle_post_message(request.environ, None, None)
-    asyncio.run(handle())
-    return Response("ok", status=202)
+async def handle_messages(request: Request):
+    await sse_transport.handle_post_message(
+        request.scope, request.receive, request._send
+    )
 
-@flask_app.route("/health")
-def health():
-    return {"status": "ok"}
+async def health(request: Request):
+    return JSONResponse({"status": "ok"})
 
+starlette_app = Starlette(
+    routes=[
+        Route("/health", health),
+        Route("/sse", handle_sse),
+        Mount("/messages/", app=sse_transport.handle_post_message),
+    ]
+)
 
 # ─── Entrypoint ───────────────────────────────────────────────────────────────
 
@@ -134,8 +135,6 @@ async def main_stdio():
 if __name__ == "__main__":
     mode = os.getenv("TRANSPORT", "stdio")
     if mode == "sse":
-        # Render / HTTP hosting
-        flask_app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+        uvicorn.run(starlette_app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
     else:
-        # Local stdio (default)
         asyncio.run(main_stdio())

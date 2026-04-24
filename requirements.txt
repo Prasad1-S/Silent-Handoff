@@ -1,5 +1,6 @@
-flask
-mcp
 groq
 requests
 python-dotenv
+mcp
+starlette
+uvicorn
