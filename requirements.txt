@@ -1,6 +1,8 @@
 groq
-requests
-python-dotenv
 mcp
 starlette
 uvicorn
+python-dotenv
+httpx
+openai          # only if you switch to openai
+anthropic       # only if you switch to anthropic
