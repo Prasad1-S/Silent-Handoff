@@ -13,6 +13,41 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ─── LOINC Normal-Range Reference Table ───────────────────────────────────────
+
+LOINC_NORMAL_RANGES = {
+    "8480-6":  {"name": "Systolic Blood Pressure",  "low": 90,   "high": 140,   "unit": "mm[Hg]"},
+    "8462-4":  {"name": "Diastolic Blood Pressure", "low": 60,   "high": 90,    "unit": "mm[Hg]"},
+    "8310-5":  {"name": "Body Temperature",         "low": 36.0, "high": 37.5,  "unit": "Cel"},
+    "2339-0":  {"name": "Glucose",                  "low": 70,   "high": 140,   "unit": "mg/dL"},
+    "718-7":   {"name": "Hemoglobin",               "low": 12.0, "high": 17.5,  "unit": "g/dL"},
+    "2160-0":  {"name": "Creatinine",               "low": 0.6,  "high": 1.2,   "unit": "mg/dL"},
+    "4548-4":  {"name": "HbA1c",                    "low": 0.0,  "high": 5.7,   "unit": "%"},
+    "59408-5": {"name": "SpO2",                     "low": 95.0, "high": 100.0, "unit": "%"},
+    "8867-4":  {"name": "Heart Rate",               "low": 60,   "high": 100,   "unit": "/min"},
+    "9279-1":  {"name": "Respiratory Rate",         "low": 12,   "high": 20,    "unit": "/min"},
+    "29463-7": {"name": "Body Weight",              "low": None, "high": None,  "unit": "kg"},
+    "39156-5": {"name": "BMI",                      "low": 18.5, "high": 24.9,  "unit": "kg/m2"},
+}
+
+# Acute vitals — right-now emergencies, highest weight
+ACUTE_VITAL_LOINCS = {
+    "59408-5",  # SpO2
+    "8867-4",   # Heart Rate
+    "9279-1",   # Respiratory Rate
+    "8480-6",   # Systolic BP
+    "8462-4",   # Diastolic BP
+    "8310-5",   # Body Temperature
+}
+
+# Biometric history — chronic background, lowest weight
+BIOMETRIC_LOINCS = {
+    "29463-7",  # Body Weight
+    "39156-5",  # BMI
+    "8302-2",   # Body Height
+    "8287-5",   # Head Circumference
+}
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _get(data, *keys, default="N/A"):
@@ -90,6 +125,170 @@ def validate_fhir_url(url: str) -> bool:
         return True
     except Exception:
         return False
+
+
+# ─── Deterministic Observation Classifier ────────────────────────────────────
+
+def get_observation_weight(loinc_code: str | None) -> str:
+    """
+    Returns weight category for a LOINC code:
+    - "ACUTE"     if in ACUTE_VITAL_LOINCS  (right-now emergencies)
+    - "BIOMETRIC" if in BIOMETRIC_LOINCS    (chronic background)
+    - "LAB"       for everything else
+    """
+    if loinc_code is None:
+        return "LAB"
+    if loinc_code in ACUTE_VITAL_LOINCS:
+        return "ACUTE"
+    if loinc_code in BIOMETRIC_LOINCS:
+        return "BIOMETRIC"
+    return "LAB"
+
+
+def calculate_weighted_acuity(classified_observations: list[dict]) -> tuple[str, str]:
+    """
+    Weighted acuity algorithm — BIOMETRIC-only findings can never exceed STABLE.
+
+    Returns:
+        (acuity: str, basis: str)
+        acuity  — "CRITICAL" | "HIGH" | "MODERATE" | "STABLE"
+        basis   — "acute_vitals" | "labs" | "biometric_only"
+    """
+    acute   = [c for c in classified_observations if c.get("weight") == "ACUTE"]
+    labs    = [c for c in classified_observations if c.get("weight") == "LAB"]
+    bio     = [c for c in classified_observations if c.get("weight") == "BIOMETRIC"]
+
+    acute_critical = [c for c in acute if c.get("status") == "CRITICAL"]
+    acute_abnormal = [c for c in acute if c.get("status") == "ABNORMAL"]
+    lab_critical   = [c for c in labs  if c.get("status") == "CRITICAL"]
+    lab_abnormal   = [c for c in labs  if c.get("status") == "ABNORMAL"]
+
+    # Build a quick value lookup by LOINC code (most-recent / only observation)
+    val: dict[str, float | None] = {}
+    for c in classified_observations:
+        code = c.get("loinc_code")
+        if code:
+            val[code] = c.get("value")
+
+    def v(code: str) -> float | None:
+        return val.get(code)
+
+    # ── CRITICAL thresholds ────────────────────────────────────────────────────
+    if acute_critical:
+        return "CRITICAL", "acute_vitals"
+    spo2 = v("59408-5")
+    hr   = v("8867-4")
+    rr   = v("9279-1")
+    sbp  = v("8480-6")
+    temp = v("8310-5")
+
+    if spo2 is not None and spo2 < 90:
+        return "CRITICAL", "acute_vitals"
+    if hr is not None and (hr > 130 or hr < 40):
+        return "CRITICAL", "acute_vitals"
+    if rr is not None and rr > 30:
+        return "CRITICAL", "acute_vitals"
+    if sbp is not None and (sbp > 180 or sbp < 80):
+        return "CRITICAL", "acute_vitals"
+    if temp is not None and (temp > 39.5 or temp < 35.0):
+        return "CRITICAL", "acute_vitals"
+
+    # ── HIGH thresholds ────────────────────────────────────────────────────────
+    if acute_abnormal:
+        return "HIGH", "acute_vitals"
+    if len(lab_critical) >= 2:
+        return "HIGH", "labs"
+    if sbp is not None and sbp > 160:
+        return "HIGH", "acute_vitals"
+    if spo2 is not None and spo2 < 94:
+        return "HIGH", "acute_vitals"
+    if hr is not None and hr > 110:
+        return "HIGH", "acute_vitals"
+
+    # ── MODERATE thresholds ────────────────────────────────────────────────────
+    if len(lab_critical) >= 1:
+        return "MODERATE", "labs"
+    if len(lab_abnormal) >= 3:
+        return "MODERATE", "labs"
+    # Any acute vital outside normal range (but not CRITICAL/ABNORMAL already handled)
+    if any(c.get("status") in ("CRITICAL", "ABNORMAL") for c in acute):
+        return "MODERATE", "acute_vitals"
+
+    # ── STABLE ─────────────────────────────────────────────────────────────────
+    # Only biometric abnormalities, or all clear
+    any_bio_abnormal = any(c.get("status") in ("CRITICAL", "ABNORMAL") for c in bio)
+    basis = "biometric_only" if any_bio_abnormal else "labs"
+    return "STABLE", basis
+
+
+def classify_observation(observation: dict) -> dict:
+    """
+    Classify a single FHIR Observation resource against LOINC_NORMAL_RANGES.
+
+    Returns a dict with:
+      name, value, unit, loinc_code, normal_range, status, grounded
+    """
+    # Resolve LOINC code from coding array
+    loinc_code: str | None = None
+    for coding in observation.get("code", {}).get("coding", []):
+        if coding.get("system") == "http://loinc.org" and coding.get("code"):
+            loinc_code = str(coding["code"])
+            break
+
+    # Extract numeric value from valueQuantity
+    vq = observation.get("valueQuantity", {})
+    raw_value = vq.get("value")
+    try:
+        value: float | None = float(raw_value) if raw_value is not None else None
+    except (TypeError, ValueError):
+        value = None
+
+    unit: str = vq.get("unit", "")
+
+    # Default / unknown result scaffold
+    result = {
+        "name": observation.get("code", {}).get("text") or loinc_code or "Unknown",
+        "value": value,
+        "unit": unit,
+        "loinc_code": loinc_code,
+        "normal_range": "varies",
+        "status": "UNKNOWN",
+        "grounded": False,
+    }
+
+    # Always set weight — even for ungrounded observations
+    result["weight"] = get_observation_weight(loinc_code)
+
+    if loinc_code not in LOINC_NORMAL_RANGES:
+        return result  # not in table — ungrounded
+
+    ref = LOINC_NORMAL_RANGES[loinc_code]
+    result["name"] = ref["name"]
+    result["grounded"] = True
+    # Use the table unit if observation didn't carry one
+    if not result["unit"]:
+        result["unit"] = ref["unit"]
+
+    low, high = ref["low"], ref["high"]
+    if low is None or high is None:
+        result["normal_range"] = "varies"
+        result["status"] = "UNKNOWN"
+        return result
+
+    result["normal_range"] = f"{low}-{high} {ref['unit']}"
+
+    if value is None:
+        return result  # can't classify without a numeric value
+
+    if value > high * 1.2 or value < low * 0.8:
+        result["status"] = "CRITICAL"
+    elif value > high or value < low:
+        result["status"] = "ABNORMAL"
+    else:
+        result["status"] = "NORMAL"
+
+    result["weight"] = get_observation_weight(loinc_code)
+    return result
 
 
 # ─── Extraction helpers ────────────────────────────────────────────────────────
@@ -237,6 +436,98 @@ def fetch_recent_encounters(patient_id: str, base_url: str, limit: int = 5) -> l
         return []
     data = _fhir_get(f"{base_url}/Encounter?patient={patient_id}&_sort=-date&_count={limit}")
     return [_extract_encounter(r) for r in _bundle_resources(data)]
+
+
+RXNAV_INTERACTION_URL = "https://rxnav.nlm.nih.gov/REST/interaction/list.json"
+
+
+def fetch_rxnorm_interactions(rxcui_list: list[str]) -> dict:
+    """
+    Query the NIH RxNav interaction API for a list of RxCUI codes.
+
+    Args:
+        rxcui_list: List of RxNorm CUI strings (e.g. ["161", "1191"]).
+
+    Returns:
+        Parsed JSON response dict from RxNav, or {} on any failure.
+    """
+    if not rxcui_list:
+        return {}
+    rxcuis_param = " ".join(rxcui_list)
+    url = f"{RXNAV_INTERACTION_URL}?rxcuis={requests.utils.quote(rxcuis_param, safe='')}"
+    try:
+        resp = requests.get(url, timeout=10, headers={"Accept": "application/json"})
+        if resp.status_code == 200:
+            return resp.json()
+        print(f"[fhir_client] RxNav returned HTTP {resp.status_code} for rxcuis={rxcuis_param}")
+    except Exception as e:
+        print(f"[fhir_client] RxNav request failed: {e}")
+    return {}
+
+
+CLINICALTRIALS_URL = "https://clinicaltrials.gov/api/v2/studies"
+
+
+def fetch_clinical_trials(condition_name: str, state: str = None) -> list[dict]:
+    """
+    Query the ClinicalTrials.gov v2 public API for RECRUITING trials.
+
+    Args:
+        condition_name: Medical condition to search (e.g. "Hypertension").
+        state: Optional US state to note in results (not filterable via v2 API
+               query param — included for future use / logging).
+
+    Returns:
+        List of up to 3 trial dicts, or [] on any failure or empty results.
+    """
+    try:
+        encoded = urllib.parse.quote(condition_name)
+        url = (
+            f"{CLINICALTRIALS_URL}"
+            f"?query.cond={encoded}"
+            f"&filter.overallStatus=RECRUITING"
+            f"&pageSize=3"
+        )
+        resp = requests.get(url, timeout=5, headers={"Accept": "application/json"})
+        if resp.status_code != 200:
+            print(f"[fhir_client] ClinicalTrials API HTTP {resp.status_code} for '{condition_name}'")
+            return []
+
+        data = resp.json()
+        studies = data.get("studies", [])
+        if not studies:
+            return []
+
+        results = []
+        for study in studies:
+            try:
+                proto = study.get("protocolSection", {})
+                ident = proto.get("identificationModule", {})
+                design = proto.get("designModule", {})
+                contacts = proto.get("contactsLocationsModule", {})
+
+                nct_id = ident.get("nctId", "")
+                phases = design.get("phases", [])
+                phase_str = "/".join(phases) if phases else "N/A"
+                locations = contacts.get("locations", [])
+
+                results.append({
+                    "trial_id": nct_id,
+                    "trial_name": ident.get("briefTitle", "N/A"),
+                    "status": "RECRUITING",
+                    "phase": phase_str,
+                    "location_count": len(locations),
+                    "url": f"https://clinicaltrials.gov/study/{nct_id}" if nct_id else "N/A",
+                })
+            except Exception as inner_e:
+                print(f"[fhir_client] ClinicalTrials study parse error: {inner_e}")
+                continue
+
+        return results
+
+    except Exception as e:
+        print(f"[fhir_client] ClinicalTrials request failed for '{condition_name}': {e}")
+        return []
 
 
 def get_patient_summary(patient_id: str, base_url: str = None) -> dict:
